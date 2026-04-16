@@ -42,4 +42,8 @@ pub enum PluginError {
     /// SoundCloud returned access-denied for a private track.
     #[error("SoundCloud resource is private: {0}")]
     Private(String),
+
+    /// The resolved track has no playable transcodings.
+    #[error("no stream available for this SoundCloud track")]
+    NoStreamAvailable,
 }

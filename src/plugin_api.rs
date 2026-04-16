@@ -6,7 +6,8 @@
 use extism_pdk::*;
 
 use crate::api::{
-    build_resolve_request, parse_http_response, parse_resolve_response, ResolveResponse,
+    build_resolve_request, build_stream_request, parse_http_response, parse_resolve_response,
+    parse_stream_url_response, pick_best_transcoding, ResolveResponse,
 };
 use crate::error::PluginError;
 use crate::{
@@ -90,6 +91,50 @@ pub fn extract_track(url: String) -> FnResult<String> {
     Ok(serde_json::to_string(&response)?)
 }
 
+/// Resolve the direct CDN stream URL for a single SoundCloud track.
+///
+/// Input JSON: `{ "url", "quality"?, "format"?, "audio_only"? }`.
+/// Returns the raw CDN audio URL. SoundCloud resolution requires two HTTP
+/// round-trips: one to `/resolve` (get track metadata + transcoding templates)
+/// and one to the chosen template URL (get the actual CDN URL).
+///
+/// `quality`, `format`, and `audio_only` are accepted for API parity with
+/// other plugins but are not used: SoundCloud provides only one quality level
+/// per track for non-Go+ accounts, and the stream is always audio-only.
+#[plugin_fn]
+pub fn resolve_stream_url(input: String) -> FnResult<String> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        url: String,
+    }
+
+    let params: Input =
+        serde_json::from_str(&input).map_err(|e| error_to_fn_error(PluginError::SerdeJson(e)))?;
+
+    ensure_track(&params.url).map_err(error_to_fn_error)?;
+
+    let resolved = resolve(&params.url)?;
+    let track = match resolved {
+        ResolveResponse::Track(t) => t,
+        _ => {
+            return Err(error_to_fn_error(PluginError::UnsupportedUrl(
+                "resolved resource is not a track".into(),
+            )))
+        }
+    };
+
+    let transcodings = track
+        .media
+        .as_ref()
+        .map(|m| m.transcodings.as_slice())
+        .unwrap_or(&[]);
+
+    let best = pick_best_transcoding(transcodings)
+        .ok_or_else(|| error_to_fn_error(PluginError::NoStreamAvailable))?;
+
+    fetch_stream_url(&best.url)
+}
+
 // ── Host function wiring ──────────────────────────────────────────────────────
 
 /// Issue a `/resolve` call against api-v2.soundcloud.com via the host and
@@ -135,6 +180,23 @@ fn read_client_id() -> String {
     //      "SoundCloud resource is private" error.
     //   4. Inputs/outputs are owned JSON strings — no aliasing concerns.
     unsafe { get_config("client_id".to_string()) }.unwrap_or_default()
+}
+
+/// Call a SoundCloud transcoding template URL to obtain the actual CDN
+/// stream URL.
+///
+/// The template URL is appended with `?client_id=<id>` and the response
+/// JSON `{ "url": "..." }` is parsed to extract the CDN URL.
+fn fetch_stream_url(template_url: &str) -> FnResult<String> {
+    let client_id = read_client_id();
+    let req_json = build_stream_request(template_url, &client_id).map_err(error_to_fn_error)?;
+    // SAFETY: identical host-function invariants to `resolve` above — the
+    // host-side symbol, ABI, capability gate (`http=true`), and owned JSON
+    // I/O all apply unchanged. See `resolve` for the full invariant list.
+    let resp_json = unsafe { http_request(req_json)? };
+    let response = parse_http_response(&resp_json).map_err(error_to_fn_error)?;
+    let body = response.into_success_body().map_err(error_to_fn_error)?;
+    parse_stream_url_response(&body).map_err(error_to_fn_error)
 }
 
 fn error_to_fn_error(err: PluginError) -> WithReturnCode<extism_pdk::Error> {

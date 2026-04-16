@@ -258,6 +258,7 @@ mod tests {
                 username: "Forss".into(),
             }),
             streamable: Some(true),
+            media: None,
         }
     }
 
