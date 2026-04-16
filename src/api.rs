@@ -406,4 +406,50 @@ mod tests {
         assert!(req_str.contains("client_id=abc123"));
         assert!(req_str.contains("url=https%3A%2F%2Fsoundcloud.com%2Fforss%2Fflickermood"));
     }
+
+    #[test]
+    fn pick_best_transcoding_prefers_progressive_over_hls() {
+        let transcodings = vec![
+            Transcoding { url: "hls_url".into(), format: Some(TranscodingFormat { protocol: "hls".into(), mime_type: "".into() }), quality: None },
+            Transcoding { url: "prog_url".into(), format: Some(TranscodingFormat { protocol: "progressive".into(), mime_type: "".into() }), quality: None },
+        ];
+        assert_eq!(pick_best_transcoding(&transcodings).unwrap().url, "prog_url");
+    }
+
+    #[test]
+    fn pick_best_transcoding_falls_back_to_hls() {
+        let transcodings = vec![
+            Transcoding { url: "hls_url".into(), format: Some(TranscodingFormat { protocol: "hls".into(), mime_type: "".into() }), quality: None },
+        ];
+        assert_eq!(pick_best_transcoding(&transcodings).unwrap().url, "hls_url");
+    }
+
+    #[test]
+    fn pick_best_transcoding_returns_none_for_empty() {
+        assert!(pick_best_transcoding(&[]).is_none());
+    }
+
+    #[test]
+    fn build_stream_request_appends_client_id_without_existing_query() {
+        let req_str = build_stream_request("https://cf-media.sndcdn.com/123", "myid").unwrap();
+        assert!(req_str.contains("client_id=myid"));
+        assert!(req_str.contains("?client_id="));
+    }
+
+    #[test]
+    fn build_stream_request_uses_ampersand_when_query_already_present() {
+        let req_str = build_stream_request("https://cf-media.sndcdn.com/123?foo=bar", "myid").unwrap();
+        assert!(req_str.contains("&client_id=myid"));
+    }
+
+    #[test]
+    fn parse_stream_url_response_extracts_url() {
+        let url = parse_stream_url_response(r#"{"url":"https://cdn.example.com/audio.mp3"}"#).unwrap();
+        assert_eq!(url, "https://cdn.example.com/audio.mp3");
+    }
+
+    #[test]
+    fn parse_stream_url_response_rejects_malformed() {
+        assert!(matches!(parse_stream_url_response("not json").unwrap_err(), PluginError::ParseJson(_)));
+    }
 }
