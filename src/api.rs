@@ -138,11 +138,93 @@ pub struct Track {
     pub user: Option<TrackUser>,
     #[serde(default)]
     pub streamable: Option<bool>,
+    /// Transcodings provided by SoundCloud — each entry is a template URL
+    /// that must be resolved to obtain the actual CDN stream URL.
+    #[serde(default)]
+    pub media: Option<TrackMedia>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct TrackMedia {
+    #[serde(default)]
+    pub transcodings: Vec<Transcoding>,
+}
+
+/// A single transcoding entry from the `/resolve` response.
+///
+/// The `url` field is a SoundCloud API endpoint (not a CDN URL). Calling it
+/// with `?client_id=<id>` as a GET request returns a
+/// `{ "url": "<actual_cdn_url>" }` JSON payload.
+#[derive(Debug, Deserialize)]
+pub struct Transcoding {
+    pub url: String,
+    #[serde(default)]
+    pub format: Option<TranscodingFormat>,
+    #[serde(default)]
+    pub quality: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct TranscodingFormat {
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub mime_type: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TrackUser {
     pub username: String,
+}
+
+/// Build a request to resolve a transcoding template URL into the actual
+/// CDN stream URL. SoundCloud requires `client_id` as a query parameter.
+pub fn build_stream_request(transcoding_url: &str, client_id: &str) -> Result<String, PluginError> {
+    let url = format!(
+        "{}?client_id={}",
+        transcoding_url,
+        urlencode(client_id),
+    );
+    let req = HttpRequest {
+        method: "GET".into(),
+        url,
+        headers: HashMap::new(),
+        body: None,
+    };
+    Ok(serde_json::to_string(&req)?)
+}
+
+/// Parse the `{ "url": "<cdn_url>" }` JSON returned by a transcoding
+/// template URL call.
+pub fn parse_stream_url_response(body: &str) -> Result<String, PluginError> {
+    #[derive(Deserialize)]
+    struct StreamUrlResponse {
+        url: String,
+    }
+    let parsed: StreamUrlResponse =
+        serde_json::from_str(body).map_err(|e| PluginError::ParseJson(e.to_string()))?;
+    Ok(parsed.url)
+}
+
+/// Select the best transcoding from a track's media list.
+///
+/// Preference order:
+/// 1. `progressive` protocol (direct HTTP download, no HLS segmentation)
+/// 2. `hls` (streaming, but universally supported)
+///
+/// Within each protocol, no further quality sorting is attempted — SoundCloud
+/// typically provides only one quality level per protocol for non-Go+ tracks.
+pub fn pick_best_transcoding(transcodings: &[Transcoding]) -> Option<&Transcoding> {
+    // Prefer progressive (direct CDN link) over HLS adaptive.
+    transcodings
+        .iter()
+        .find(|t| {
+            t.format
+                .as_ref()
+                .map(|f| f.protocol == "progressive")
+                .unwrap_or(false)
+        })
+        .or_else(|| transcodings.first())
 }
 
 #[derive(Debug, Deserialize)]
