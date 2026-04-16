@@ -180,9 +180,11 @@ pub struct TrackUser {
 /// Build a request to resolve a transcoding template URL into the actual
 /// CDN stream URL. SoundCloud requires `client_id` as a query parameter.
 pub fn build_stream_request(transcoding_url: &str, client_id: &str) -> Result<String, PluginError> {
+    let separator = if transcoding_url.contains('?') { '&' } else { '?' };
     let url = format!(
-        "{}?client_id={}",
+        "{}{}client_id={}",
         transcoding_url,
+        separator,
         urlencode(client_id),
     );
     let req = HttpRequest {
@@ -224,7 +226,14 @@ pub fn pick_best_transcoding(transcodings: &[Transcoding]) -> Option<&Transcodin
                 .map(|f| f.protocol == "progressive")
                 .unwrap_or(false)
         })
-        .or_else(|| transcodings.first())
+        .or_else(|| {
+            transcodings.iter().find(|t| {
+                t.format
+                    .as_ref()
+                    .map(|f| f.protocol == "hls")
+                    .unwrap_or(false)
+            })
+        })
 }
 
 #[derive(Debug, Deserialize)]
