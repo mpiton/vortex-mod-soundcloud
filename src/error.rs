@@ -21,6 +21,10 @@ pub enum PluginError {
     #[error("host function response invalid: {0}")]
     HostResponse(String),
 
+    /// yt-dlp subprocess returned a non-zero exit code.
+    #[error("yt-dlp failed (exit code {exit_code}): {stderr}")]
+    Subprocess { exit_code: i32, stderr: String },
+
     /// URL could not be classified as a SoundCloud resource (host
     /// not recognised, malformed path, not SoundCloud at all).
     #[error("URL is not a recognised SoundCloud resource: {0}")]
@@ -46,4 +50,9 @@ pub enum PluginError {
     /// The resolved track has no playable transcodings.
     #[error("no stream available for this SoundCloud track")]
     NoStreamAvailable,
+
+    /// The resolved track is only available as HLS and must be downloaded via
+    /// the plugin's native `download_to_file` path.
+    #[error("audio is only available as an adaptive stream (HLS/DASH) for this SoundCloud track; use download_to_file")]
+    AdaptiveStreamOnly,
 }

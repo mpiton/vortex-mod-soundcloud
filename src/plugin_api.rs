@@ -6,14 +6,22 @@
 use extism_pdk::*;
 
 use crate::api::{
-    build_resolve_request, build_stream_request, parse_http_response, parse_resolve_response,
-    parse_stream_url_response, pick_best_transcoding, ResolveResponse,
+    build_resolve_request, build_stream_request, build_user_tracks_request, parse_http_response,
+    parse_resolve_response, parse_stream_url_response, parse_track_collection_response,
+    pick_best_transcoding, track_resource_id, user_resource_id, ResolveResponse, Track, User,
 };
 use crate::error::PluginError;
-use crate::{
-    build_playlist_response, build_single_track_response, ensure_playlist, ensure_soundcloud_url,
-    ensure_track, handle_can_handle, handle_supports_playlist, response_to_extract_links,
+use crate::extractor::{
+    parse_download_path_from_stdout, parse_subprocess_response, yt_dlp_args_for_download_to_file,
+    DEFAULT_DOWNLOAD_TIMEOUT_MS,
 };
+use crate::{
+    build_artist_response, build_playlist_response, build_single_track_response, ensure_playlist,
+    ensure_soundcloud_url, ensure_track, handle_can_handle, handle_supports_playlist,
+    response_to_extract_links,
+};
+
+const MAX_ARTIST_TRACK_PAGES: usize = 20;
 
 // ── Host function imports ─────────────────────────────────────────────────────
 
@@ -22,6 +30,7 @@ extern "ExtismHost" {
     /// JSON in → JSON out — see `HttpRequest` / `HttpResponse` envelopes.
     fn http_request(req: String) -> String;
     fn get_config(key: String) -> String;
+    fn run_subprocess(req: String) -> String;
 }
 
 // ── Plugin function exports ───────────────────────────────────────────────────
@@ -41,7 +50,13 @@ pub fn extract_links(url: String) -> FnResult<String> {
     ensure_soundcloud_url(&url).map_err(error_to_fn_error)?;
 
     let resolved = resolve(&url)?;
-    let response = response_to_extract_links(resolved).map_err(error_to_fn_error)?;
+    let response = match resolved {
+        ResolveResponse::User(user) => {
+            let tracks = fetch_all_user_tracks(&user)?;
+            build_artist_response(&user, tracks)
+        }
+        other => response_to_extract_links(other).map_err(error_to_fn_error)?,
+    };
     Ok(serde_json::to_string(&response)?)
 }
 
@@ -52,15 +67,7 @@ pub fn extract_playlist(url: String) -> FnResult<String> {
     let resolved = resolve(&url)?;
     let response = match resolved {
         ResolveResponse::Playlist(p) => build_playlist_response(p),
-        // Artist profiles need a second call; for now we surface a clear
-        // error so the UI can paginate via a follow-up call when that
-        // endpoint support lands.
-        ResolveResponse::User(u) => {
-            return Err(error_to_fn_error(PluginError::UnsupportedUrl(format!(
-                "artist profile '{}' — artist pagination not yet implemented",
-                u.username
-            ))))
-        }
+        ResolveResponse::User(user) => build_artist_response(&user, fetch_all_user_tracks(&user)?),
         ResolveResponse::Track(_) => {
             return Err(error_to_fn_error(PluginError::UnsupportedUrl(
                 "single track cannot be extracted as playlist".into(),
@@ -132,7 +139,99 @@ pub fn resolve_stream_url(input: String) -> FnResult<String> {
     let best = pick_best_transcoding(transcodings)
         .ok_or_else(|| error_to_fn_error(PluginError::NoStreamAvailable))?;
 
+    if best
+        .format
+        .as_ref()
+        .is_some_and(|format| format.protocol == "hls")
+    {
+        return Err(error_to_fn_error(PluginError::AdaptiveStreamOnly));
+    }
+
     fetch_stream_url(&best.url)
+}
+
+#[plugin_fn]
+pub fn download_to_file(input: String) -> FnResult<String> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        url: String,
+        #[serde(default)]
+        format: String,
+        output_dir: String,
+    }
+
+    let params: Input =
+        serde_json::from_str(&input).map_err(|e| error_to_fn_error(PluginError::SerdeJson(e)))?;
+
+    ensure_track(&params.url).map_err(error_to_fn_error)?;
+
+    let args = yt_dlp_args_for_download_to_file(&params.url, &params.format, &params.output_dir);
+    let req = crate::extractor::SubprocessRequest {
+        binary: "yt-dlp".into(),
+        args,
+        timeout_ms: DEFAULT_DOWNLOAD_TIMEOUT_MS,
+    };
+    let req_json =
+        serde_json::to_string(&req).map_err(|e| error_to_fn_error(PluginError::SerdeJson(e)))?;
+
+    let resp_json = unsafe { run_subprocess(req_json)? };
+    let stdout = parse_subprocess_response(&resp_json).map_err(error_to_fn_error)?;
+    parse_download_path_from_stdout(&stdout).map_err(error_to_fn_error)
+}
+
+fn fetch_all_user_tracks(user: &User) -> FnResult<Vec<Track>> {
+    let client_id = read_client_id();
+    let user_id = user_resource_id(user).ok_or_else(|| {
+        error_to_fn_error(PluginError::UnsupportedUrl(format!(
+            "artist profile '{}' has no stable id or urn in the resolve response",
+            user.username
+        )))
+    })?;
+
+    let mut next_href: Option<String> = None;
+    let mut tracks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for _ in 0..MAX_ARTIST_TRACK_PAGES {
+        let req_json = build_user_tracks_request(&user_id, &client_id, next_href.as_deref())
+            .map_err(error_to_fn_error)?;
+        let body = perform_soundcloud_request(req_json)?;
+        let page = parse_track_collection_response(&body).map_err(error_to_fn_error)?;
+
+        for track in page.collection {
+            let dedupe_key = track_resource_id(&track)
+                .or_else(|| track.permalink_url.clone())
+                .unwrap_or_else(|| track.title.clone());
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            if track
+                .permalink_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty())
+            {
+                tracks.push(track);
+            }
+        }
+
+        match page.next_href.filter(|href| !href.trim().is_empty()) {
+            Some(href) => next_href = Some(href),
+            None => {
+                if tracks.is_empty() {
+                    return Err(error_to_fn_error(PluginError::UnsupportedUrl(format!(
+                        "artist profile '{}' has no downloadable public tracks",
+                        user.username
+                    ))));
+                }
+                return Ok(tracks);
+            }
+        }
+    }
+
+    Err(error_to_fn_error(PluginError::UnsupportedUrl(format!(
+        "artist profile '{}' exceeded the pagination limit ({MAX_ARTIST_TRACK_PAGES} pages)",
+        user.username
+    ))))
 }
 
 // ── Host function wiring ──────────────────────────────────────────────────────
@@ -156,9 +255,7 @@ fn resolve(url: &str) -> FnResult<ResolveResponse> {
     //      error which `?` propagates safely.
     //   4. Inputs and outputs are owned, serialisable JSON strings — no
     //      aliasing or mutability concerns.
-    let resp_json = unsafe { http_request(req_json)? };
-    let response = parse_http_response(&resp_json).map_err(error_to_fn_error)?;
-    let body = response.into_success_body().map_err(error_to_fn_error)?;
+    let body = perform_soundcloud_request(req_json)?;
     parse_resolve_response(&body).map_err(error_to_fn_error)
 }
 
@@ -190,13 +287,17 @@ fn read_client_id() -> String {
 fn fetch_stream_url(template_url: &str) -> FnResult<String> {
     let client_id = read_client_id();
     let req_json = build_stream_request(template_url, &client_id).map_err(error_to_fn_error)?;
-    // SAFETY: identical host-function invariants to `resolve` above — the
-    // host-side symbol, ABI, capability gate (`http=true`), and owned JSON
-    // I/O all apply unchanged. See `resolve` for the full invariant list.
+    let body = perform_soundcloud_request(req_json)?;
+    parse_stream_url_response(&body).map_err(error_to_fn_error)
+}
+
+fn perform_soundcloud_request(req_json: String) -> FnResult<String> {
+    // SAFETY: `http_request` is resolved by the Vortex plugin host at
+    // load time. Inputs and outputs are owned JSON strings, and host-side
+    // capability checks run before the request executes.
     let resp_json = unsafe { http_request(req_json)? };
     let response = parse_http_response(&resp_json).map_err(error_to_fn_error)?;
-    let body = response.into_success_body().map_err(error_to_fn_error)?;
-    parse_stream_url_response(&body).map_err(error_to_fn_error)
+    response.into_success_body().map_err(error_to_fn_error)
 }
 
 fn error_to_fn_error(err: PluginError) -> WithReturnCode<extism_pdk::Error> {
