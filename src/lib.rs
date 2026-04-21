@@ -11,6 +11,7 @@
 //! can be unit-tested natively.
 
 pub mod api;
+pub mod client_id;
 pub mod error;
 pub mod extractor;
 pub mod url_matcher;
