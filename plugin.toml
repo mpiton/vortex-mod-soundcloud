@@ -1,6 +1,6 @@
 [plugin]
 name = "vortex-mod-soundcloud"
-version = "1.1.0"
+version = "1.2.0"
 category = "crawler"
 author = "vortex-community"
 description = "SoundCloud tracks, playlists, and artist profiles"
