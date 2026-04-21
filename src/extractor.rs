@@ -18,12 +18,16 @@ pub struct SubprocessResponse {
     pub stderr: String,
 }
 
-pub const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 pub const DEFAULT_DOWNLOAD_TIMEOUT_MS: u64 = 1_800_000;
 
 pub fn yt_dlp_args_for_download_to_file(url: &str, format: &str, output_dir: &str) -> Vec<String> {
     let audio_format = normalize_audio_format(format);
-    let output_template = format!("{output_dir}/%(id)s.%(ext)s");
+    // yt-dlp treats `%(...)s` in the -o template as a format specifier, so a
+    // literal `%` in output_dir (e.g. "/tmp/100%done/") would either fail or
+    // silently redirect the download to an unintended path. Doubling `%` is
+    // the documented escape.
+    let sanitized_dir = output_dir.replace('%', "%%");
+    let output_template = format!("{sanitized_dir}/%(id)s.%(ext)s");
 
     vec![
         "--extract-audio".into(),
@@ -39,15 +43,6 @@ pub fn yt_dlp_args_for_download_to_file(url: &str, format: &str, output_dir: &st
         "--".into(),
         url.into(),
     ]
-}
-
-pub fn build_subprocess_request(args: Vec<String>) -> Result<String, PluginError> {
-    let req = SubprocessRequest {
-        binary: "yt-dlp".into(),
-        args,
-        timeout_ms: DEFAULT_TIMEOUT_MS,
-    };
-    Ok(serde_json::to_string(&req)?)
 }
 
 pub fn parse_subprocess_response(response_json: &str) -> Result<String, PluginError> {
@@ -122,5 +117,30 @@ mod tests {
             parse_download_path_from_stdout(stdout).unwrap(),
             "/tmp/out.mp3"
         );
+    }
+
+    #[test]
+    fn download_args_escape_percent_in_output_dir() {
+        // A directory containing `%` must be escaped as `%%` so yt-dlp
+        // doesn't interpret it as the start of a format specifier.
+        let args = yt_dlp_args_for_download_to_file(
+            "https://soundcloud.com/forss/flickermood",
+            "mp3",
+            "/tmp/100%done",
+        );
+        let output_idx = args.iter().position(|a| a == "--output").unwrap();
+        let template = &args[output_idx + 1];
+        assert_eq!(template, "/tmp/100%%done/%(id)s.%(ext)s");
+    }
+
+    #[test]
+    fn download_args_leave_clean_dir_untouched() {
+        let args = yt_dlp_args_for_download_to_file(
+            "https://soundcloud.com/forss/flickermood",
+            "mp3",
+            "/tmp/vx",
+        );
+        let output_idx = args.iter().position(|a| a == "--output").unwrap();
+        assert_eq!(&args[output_idx + 1], "/tmp/vx/%(id)s.%(ext)s");
     }
 }

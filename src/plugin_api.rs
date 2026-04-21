@@ -228,10 +228,15 @@ fn fetch_all_user_tracks(user: &User) -> FnResult<Vec<Track>> {
         }
     }
 
-    Err(error_to_fn_error(PluginError::UnsupportedUrl(format!(
-        "artist profile '{}' exceeded the pagination limit ({MAX_ARTIST_TRACK_PAGES} pages)",
-        user.username
-    ))))
+    // Hit MAX_ARTIST_TRACK_PAGES with more pages still available: return
+    // what we've collected so far (truncation) instead of discarding it.
+    if tracks.is_empty() {
+        return Err(error_to_fn_error(PluginError::UnsupportedUrl(format!(
+            "artist profile '{}' has no downloadable public tracks",
+            user.username
+        ))));
+    }
+    Ok(tracks)
 }
 
 // ── Host function wiring ──────────────────────────────────────────────────────
