@@ -83,6 +83,28 @@ pub fn build_resolve_request(original_url: &str, client_id: &str) -> Result<Stri
     Ok(serde_json::to_string(&req)?)
 }
 
+pub fn build_user_tracks_request(
+    user_id: &str,
+    client_id: &str,
+    next_href: Option<&str>,
+) -> Result<String, PluginError> {
+    let url = match next_href {
+        Some(next) => append_client_id(next, client_id),
+        None => format!(
+            "https://api-v2.soundcloud.com/users/{}/tracks?linked_partitioning=true&page_size=50&client_id={}",
+            urlencode(user_id),
+            urlencode(client_id),
+        ),
+    };
+    let req = HttpRequest {
+        method: "GET".into(),
+        url,
+        headers: HashMap::new(),
+        body: None,
+    };
+    Ok(serde_json::to_string(&req)?)
+}
+
 pub fn parse_http_response(raw: &str) -> Result<HttpResponse, PluginError> {
     serde_json::from_str(raw).map_err(|e| PluginError::HostResponse(e.to_string()))
 }
@@ -102,6 +124,14 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+fn append_client_id(url: &str, client_id: &str) -> String {
+    if url.contains("client_id=") {
+        return url.to_string();
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}client_id={}", urlencode(client_id))
 }
 
 // ── SoundCloud resource types ─────────────────────────────────────────────────
@@ -124,9 +154,28 @@ pub enum ResolveResponse {
     Unknown,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ApiId {
+    Numeric(u64),
+    Text(String),
+}
+
+impl ApiId {
+    pub fn as_string(&self) -> String {
+        match self {
+            Self::Numeric(id) => id.to_string(),
+            Self::Text(id) => id.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Track {
-    pub id: u64,
+    #[serde(default)]
+    pub id: Option<ApiId>,
+    #[serde(default)]
+    pub urn: Option<String>,
     pub title: String,
     #[serde(default)]
     pub duration: Option<u64>,
@@ -136,6 +185,8 @@ pub struct Track {
     pub artwork_url: Option<String>,
     #[serde(default)]
     pub user: Option<TrackUser>,
+    #[serde(default)]
+    pub metadata_artist: Option<String>,
     #[serde(default)]
     pub streamable: Option<bool>,
     /// Transcodings provided by SoundCloud — each entry is a template URL
@@ -180,7 +231,11 @@ pub struct TrackUser {
 /// Build a request to resolve a transcoding template URL into the actual
 /// CDN stream URL. SoundCloud requires `client_id` as a query parameter.
 pub fn build_stream_request(transcoding_url: &str, client_id: &str) -> Result<String, PluginError> {
-    let separator = if transcoding_url.contains('?') { '&' } else { '?' };
+    let separator = if transcoding_url.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     let url = format!(
         "{}{}client_id={}",
         transcoding_url,
@@ -238,7 +293,10 @@ pub fn pick_best_transcoding(transcodings: &[Transcoding]) -> Option<&Transcodin
 
 #[derive(Debug, Deserialize)]
 pub struct Playlist {
-    pub id: u64,
+    #[serde(default)]
+    pub id: Option<ApiId>,
+    #[serde(default)]
+    pub urn: Option<String>,
     pub title: String,
     #[serde(default)]
     pub permalink_url: Option<String>,
@@ -252,12 +310,39 @@ pub struct Playlist {
 
 #[derive(Debug, Deserialize)]
 pub struct User {
-    pub id: u64,
+    #[serde(default)]
+    pub id: Option<ApiId>,
+    #[serde(default)]
+    pub urn: Option<String>,
     pub username: String,
     #[serde(default)]
     pub permalink_url: Option<String>,
     #[serde(default)]
     pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrackCollectionResponse {
+    #[serde(default)]
+    pub collection: Vec<Track>,
+    #[serde(default)]
+    pub next_href: Option<String>,
+}
+
+pub fn parse_track_collection_response(body: &str) -> Result<TrackCollectionResponse, PluginError> {
+    serde_json::from_str(body).map_err(|e| PluginError::ParseJson(e.to_string()))
+}
+
+pub fn track_resource_id(track: &Track) -> Option<String> {
+    stable_resource_id(track.urn.as_ref(), track.id.as_ref())
+}
+
+pub fn user_resource_id(user: &User) -> Option<String> {
+    stable_resource_id(user.urn.as_ref(), user.id.as_ref())
+}
+
+fn stable_resource_id(urn: Option<&String>, id: Option<&ApiId>) -> Option<String> {
+    urn.cloned().or_else(|| id.map(ApiId::as_string))
 }
 
 pub fn parse_resolve_response(body: &str) -> Result<ResolveResponse, PluginError> {
@@ -306,7 +391,7 @@ mod tests {
         let resolved = parse_resolve_response(TRACK_JSON).unwrap();
         match resolved {
             ResolveResponse::Track(t) => {
-                assert_eq!(t.id, 12345);
+                assert_eq!(track_resource_id(&t).as_deref(), Some("12345"));
                 assert_eq!(t.title, "Flickermood");
                 assert_eq!(t.duration, Some(225000));
                 assert_eq!(t.user.unwrap().username, "Forss");
@@ -321,7 +406,10 @@ mod tests {
         let resolved = parse_resolve_response(PLAYLIST_JSON).unwrap();
         match resolved {
             ResolveResponse::Playlist(p) => {
-                assert_eq!(p.id, 99);
+                assert_eq!(
+                    stable_resource_id(p.urn.as_ref(), p.id.as_ref()).as_deref(),
+                    Some("99")
+                );
                 assert_eq!(p.title, "Soulhack");
                 assert_eq!(p.tracks.len(), 2);
                 assert_eq!(p.track_count, Some(2));
@@ -335,6 +423,7 @@ mod tests {
         let resolved = parse_resolve_response(USER_JSON).unwrap();
         match resolved {
             ResolveResponse::User(u) => {
+                assert_eq!(user_resource_id(&u).as_deref(), Some("42"));
                 assert_eq!(u.username, "forss");
             }
             other => panic!("expected User, got {other:?}"),
@@ -408,19 +497,62 @@ mod tests {
     }
 
     #[test]
+    fn build_user_tracks_request_uses_initial_collection_endpoint() {
+        let req_str = build_user_tracks_request("soundcloud:users:42", "abc123", None).unwrap();
+        assert!(req_str.contains("users/soundcloud%3Ausers%3A42/tracks"));
+        assert!(req_str.contains("linked_partitioning=true"));
+        assert!(req_str.contains("page_size=50"));
+        assert!(req_str.contains("client_id=abc123"));
+    }
+
+    #[test]
+    fn build_user_tracks_request_preserves_next_href_cursor() {
+        let req_str = build_user_tracks_request(
+            "ignored",
+            "abc123",
+            Some("https://api-v2.soundcloud.com/users/42/tracks?linked_partitioning=true&cursor=next-page"),
+        )
+        .unwrap();
+        assert!(req_str.contains("cursor=next-page"));
+        assert!(req_str.contains("client_id=abc123"));
+    }
+
+    #[test]
     fn pick_best_transcoding_prefers_progressive_over_hls() {
         let transcodings = vec![
-            Transcoding { url: "hls_url".into(), format: Some(TranscodingFormat { protocol: "hls".into(), mime_type: "".into() }), quality: None },
-            Transcoding { url: "prog_url".into(), format: Some(TranscodingFormat { protocol: "progressive".into(), mime_type: "".into() }), quality: None },
+            Transcoding {
+                url: "hls_url".into(),
+                format: Some(TranscodingFormat {
+                    protocol: "hls".into(),
+                    mime_type: "".into(),
+                }),
+                quality: None,
+            },
+            Transcoding {
+                url: "prog_url".into(),
+                format: Some(TranscodingFormat {
+                    protocol: "progressive".into(),
+                    mime_type: "".into(),
+                }),
+                quality: None,
+            },
         ];
-        assert_eq!(pick_best_transcoding(&transcodings).unwrap().url, "prog_url");
+        assert_eq!(
+            pick_best_transcoding(&transcodings).unwrap().url,
+            "prog_url"
+        );
     }
 
     #[test]
     fn pick_best_transcoding_falls_back_to_hls() {
-        let transcodings = vec![
-            Transcoding { url: "hls_url".into(), format: Some(TranscodingFormat { protocol: "hls".into(), mime_type: "".into() }), quality: None },
-        ];
+        let transcodings = vec![Transcoding {
+            url: "hls_url".into(),
+            format: Some(TranscodingFormat {
+                protocol: "hls".into(),
+                mime_type: "".into(),
+            }),
+            quality: None,
+        }];
         assert_eq!(pick_best_transcoding(&transcodings).unwrap().url, "hls_url");
     }
 
@@ -438,18 +570,23 @@ mod tests {
 
     #[test]
     fn build_stream_request_uses_ampersand_when_query_already_present() {
-        let req_str = build_stream_request("https://cf-media.sndcdn.com/123?foo=bar", "myid").unwrap();
+        let req_str =
+            build_stream_request("https://cf-media.sndcdn.com/123?foo=bar", "myid").unwrap();
         assert!(req_str.contains("&client_id=myid"));
     }
 
     #[test]
     fn parse_stream_url_response_extracts_url() {
-        let url = parse_stream_url_response(r#"{"url":"https://cdn.example.com/audio.mp3"}"#).unwrap();
+        let url =
+            parse_stream_url_response(r#"{"url":"https://cdn.example.com/audio.mp3"}"#).unwrap();
         assert_eq!(url, "https://cdn.example.com/audio.mp3");
     }
 
     #[test]
     fn parse_stream_url_response_rejects_malformed() {
-        assert!(matches!(parse_stream_url_response("not json").unwrap_err(), PluginError::ParseJson(_)));
+        assert!(matches!(
+            parse_stream_url_response("not json").unwrap_err(),
+            PluginError::ParseJson(_)
+        ));
     }
 }

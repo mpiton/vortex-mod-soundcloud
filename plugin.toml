@@ -1,6 +1,6 @@
 [plugin]
 name = "vortex-mod-soundcloud"
-version = "1.0.0"
+version = "1.1.0"
 category = "crawler"
 author = "vortex-community"
 description = "SoundCloud tracks, playlists, and artist profiles"
@@ -12,6 +12,7 @@ min_vortex_version = "0.1.0"
 # all network access to the host via `http_request`, so it never touches
 # sockets directly — all SSRF/egress rules are enforced host-side.
 http = true
+subprocess = ["yt-dlp"]
 
 # NOTE: Forward-compatible config documentation. The current manifest
 # parser only consumes `[plugin]` and `[capabilities]`. Values below

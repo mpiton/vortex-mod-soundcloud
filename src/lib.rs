@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod error;
+pub mod extractor;
 pub mod url_matcher;
 
 // The `plugin_api` module exports `#[plugin_fn]`-decorated functions and the
@@ -22,7 +23,7 @@ mod plugin_api;
 
 use serde::Serialize;
 
-use crate::api::{Playlist as ApiPlaylist, ResolveResponse, Track};
+use crate::api::{track_resource_id, Playlist as ApiPlaylist, ResolveResponse, Track, User};
 use crate::error::PluginError;
 use crate::url_matcher::UrlKind;
 
@@ -32,6 +33,12 @@ use crate::url_matcher::UrlKind;
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct ExtractLinksResponse {
     pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork_url: Option<String>,
     pub tracks: Vec<MediaLink>,
 }
 
@@ -56,21 +63,17 @@ pub struct MediaLink {
 /// later will force an explicit decision here instead of silently
 /// accepting it.
 pub fn handle_can_handle(url: &str) -> String {
-    // Artist profiles are *not* reported as handleable yet because
-    // `extract_playlist` currently returns `UnsupportedUrl` for
-    // `ResolveResponse::User` — advertising support would produce a
-    // false-positive capability detection and a runtime failure.
-    // Re-enable `UrlKind::Artist` here once artist pagination is wired.
     let kind = url_matcher::classify_url(url);
-    bool_to_string(matches!(kind, UrlKind::Track | UrlKind::Playlist))
+    bool_to_string(matches!(
+        kind,
+        UrlKind::Track | UrlKind::Playlist | UrlKind::Artist
+    ))
 }
 
-/// Returns `"true"` only if the URL refers to an explicit playlist /
-/// set / likes / tracks / albums collection. Artist profiles are
-/// intentionally excluded until artist pagination ships.
+/// Returns `"true"` only if the URL refers to a collection resource.
 pub fn handle_supports_playlist(url: &str) -> String {
     let kind = url_matcher::classify_url(url);
-    bool_to_string(matches!(kind, UrlKind::Playlist))
+    bool_to_string(matches!(kind, UrlKind::Playlist | UrlKind::Artist))
 }
 
 fn bool_to_string(b: bool) -> String {
@@ -82,23 +85,10 @@ fn bool_to_string(b: bool) -> String {
 }
 
 /// Reject URLs that are not a supported SoundCloud resource.
-///
-/// Artist profiles (`UrlKind::Artist`) are not accepted here until the
-/// follow-up `/users/<id>/tracks` pagination is implemented — accepting
-/// them would make `extract_links` fail with `UnsupportedUrl` *after*
-/// the routing contract claimed to handle the URL, which is worse than
-/// rejecting early.
 pub fn ensure_soundcloud_url(url: &str) -> Result<UrlKind, PluginError> {
     let kind = url_matcher::classify_url(url);
     match kind {
-        UrlKind::Track | UrlKind::Playlist => Ok(kind),
-        // Artist is a recognised SoundCloud URL but the kind we cannot
-        // service yet — surface the kind so callers can tell this
-        // apart from "not a SoundCloud URL at all".
-        UrlKind::Artist => Err(PluginError::UnsupportedResourceKind {
-            kind,
-            url: url.to_string(),
-        }),
+        UrlKind::Track | UrlKind::Playlist | UrlKind::Artist => Ok(kind),
         UrlKind::Unknown => Err(PluginError::UnsupportedUrl(url.to_string())),
     }
 }
@@ -118,8 +108,8 @@ pub fn ensure_track(url: &str) -> Result<(), PluginError> {
 pub fn ensure_playlist(url: &str) -> Result<(), PluginError> {
     let kind = url_matcher::classify_url(url);
     match kind {
-        UrlKind::Playlist => Ok(()),
-        UrlKind::Track | UrlKind::Artist => Err(PluginError::UnsupportedResourceKind {
+        UrlKind::Playlist | UrlKind::Artist => Ok(()),
+        UrlKind::Track => Err(PluginError::UnsupportedResourceKind {
             kind,
             url: url.to_string(),
         }),
@@ -130,14 +120,31 @@ pub fn ensure_playlist(url: &str) -> Result<(), PluginError> {
 /// Convert an API [`Track`] into a [`MediaLink`] with the artwork
 /// upgraded from the default 100×100 thumbnail to `t500x500` if possible.
 pub fn track_to_link(track: Track) -> MediaLink {
+    let id = stable_track_link_id(&track);
+    let artist = preferred_track_artist(&track);
     MediaLink {
-        id: track.id.to_string(),
+        id,
         title: track.title,
         url: track.permalink_url.unwrap_or_default(),
-        artist: track.user.map(|u| u.username),
+        artist,
         duration_ms: track.duration,
         artwork_url: track.artwork_url.map(upgrade_artwork),
     }
+}
+
+fn stable_track_link_id(track: &Track) -> String {
+    track_resource_id(track)
+        .or_else(|| track.permalink_url.clone())
+        .unwrap_or_else(|| track.title.clone())
+}
+
+fn preferred_track_artist(track: &Track) -> Option<String> {
+    track
+        .metadata_artist
+        .as_deref()
+        .filter(|artist| !artist.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| track.user.as_ref().map(|u| u.username.clone()))
 }
 
 /// SoundCloud returns small (100×100) artwork URLs by default. The CDN
@@ -203,8 +210,14 @@ fn split_url_suffix(url: &str) -> (&str, &str) {
 }
 
 pub fn build_single_track_response(track: Track) -> ExtractLinksResponse {
+    let title = track.title.clone();
+    let artist = preferred_track_artist(&track);
+    let artwork_url = track.artwork_url.clone().map(upgrade_artwork);
     ExtractLinksResponse {
         kind: "track",
+        title: Some(title),
+        artist,
+        artwork_url,
         tracks: vec![track_to_link(track)],
     }
 }
@@ -212,7 +225,20 @@ pub fn build_single_track_response(track: Track) -> ExtractLinksResponse {
 pub fn build_playlist_response(playlist: ApiPlaylist) -> ExtractLinksResponse {
     ExtractLinksResponse {
         kind: "playlist",
+        title: Some(playlist.title),
+        artist: None,
+        artwork_url: playlist.artwork_url.map(upgrade_artwork),
         tracks: playlist.tracks.into_iter().map(track_to_link).collect(),
+    }
+}
+
+pub fn build_artist_response(user: &User, tracks: Vec<Track>) -> ExtractLinksResponse {
+    ExtractLinksResponse {
+        kind: "artist",
+        title: Some(user.username.clone()),
+        artist: None,
+        artwork_url: user.avatar_url.clone(),
+        tracks: tracks.into_iter().map(track_to_link).collect(),
     }
 }
 
@@ -245,11 +271,12 @@ pub fn response_to_extract_links(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Track, TrackUser};
+    use crate::api::{ApiId, Track, TrackUser};
 
     fn sample_track() -> Track {
         Track {
-            id: 1,
+            id: Some(ApiId::Numeric(1)),
+            urn: None,
             title: "Flickermood".into(),
             duration: Some(225_000),
             permalink_url: Some("https://soundcloud.com/forss/flickermood".into()),
@@ -257,6 +284,7 @@ mod tests {
             user: Some(TrackUser {
                 username: "Forss".into(),
             }),
+            metadata_artist: None,
             streamable: Some(true),
             media: None,
         }
@@ -276,12 +304,8 @@ mod tests {
     }
 
     #[test]
-    fn can_handle_rejects_artist_profile_until_pagination_lands() {
-        // Artist profiles are intentionally excluded — extracting them
-        // requires a second `/users/<id>/tracks` pagination call which
-        // is not implemented yet, so advertising support would produce
-        // a false-positive followed by a runtime error.
-        assert_eq!(handle_can_handle("https://soundcloud.com/forss"), "false");
+    fn can_handle_accepts_artist_profile() {
+        assert_eq!(handle_can_handle("https://soundcloud.com/forss"), "true");
     }
 
     #[test]
@@ -309,27 +333,19 @@ mod tests {
     }
 
     #[test]
-    fn supports_playlist_false_for_artist_profile() {
+    fn supports_playlist_true_for_artist_profile() {
         assert_eq!(
             handle_supports_playlist("https://soundcloud.com/forss"),
-            "false"
+            "true"
         );
     }
 
     #[test]
-    fn ensure_soundcloud_url_rejects_artist_profile_as_unsupported_resource_kind() {
-        // Artist is a *recognised* SoundCloud URL but the handler
-        // cannot service it yet — callers should see
-        // `UnsupportedResourceKind`, not the "not a SoundCloud URL"
-        // `UnsupportedUrl` variant.
-        let err = ensure_soundcloud_url("https://soundcloud.com/forss").unwrap_err();
-        assert!(matches!(
-            err,
-            PluginError::UnsupportedResourceKind {
-                kind: UrlKind::Artist,
-                ..
-            }
-        ));
+    fn ensure_soundcloud_url_accepts_artist_profile() {
+        assert_eq!(
+            ensure_soundcloud_url("https://soundcloud.com/forss").unwrap(),
+            UrlKind::Artist
+        );
     }
 
     #[test]
@@ -473,13 +489,16 @@ mod tests {
     fn build_single_track_response_shape() {
         let r = build_single_track_response(sample_track());
         assert_eq!(r.kind, "track");
+        assert_eq!(r.title.as_deref(), Some("Flickermood"));
+        assert_eq!(r.artist.as_deref(), Some("Forss"));
         assert_eq!(r.tracks.len(), 1);
     }
 
     #[test]
     fn build_playlist_response_shape() {
         let playlist = ApiPlaylist {
-            id: 42,
+            id: Some(ApiId::Numeric(42)),
+            urn: None,
             title: "Soulhack".into(),
             permalink_url: Some("https://soundcloud.com/forss/sets/soulhack".into()),
             artwork_url: None,
@@ -488,7 +507,27 @@ mod tests {
         };
         let r = build_playlist_response(playlist);
         assert_eq!(r.kind, "playlist");
+        assert_eq!(r.title.as_deref(), Some("Soulhack"));
         assert_eq!(r.tracks.len(), 2);
+    }
+
+    #[test]
+    fn build_artist_response_shape() {
+        let user = User {
+            id: Some(ApiId::Numeric(99)),
+            urn: None,
+            username: "forss".into(),
+            permalink_url: Some("https://soundcloud.com/forss".into()),
+            avatar_url: Some("https://i1.sndcdn.com/avatars-42.jpg".into()),
+        };
+        let r = build_artist_response(&user, vec![sample_track()]);
+        assert_eq!(r.kind, "artist");
+        assert_eq!(r.title.as_deref(), Some("forss"));
+        assert_eq!(
+            r.artwork_url.as_deref(),
+            Some("https://i1.sndcdn.com/avatars-42.jpg")
+        );
+        assert_eq!(r.tracks.len(), 1);
     }
 
     #[test]
@@ -510,7 +549,8 @@ mod tests {
         // The error message must not redirect the caller to
         // `extract_playlist` (which also rejects this kind).
         let err = response_to_extract_links(ResolveResponse::User(crate::api::User {
-            id: 1,
+            id: Some(ApiId::Numeric(1)),
+            urn: None,
             username: "forss".into(),
             permalink_url: None,
             avatar_url: None,
