@@ -5,11 +5,15 @@
 
 use extism_pdk::*;
 
+use std::collections::HashMap;
+
 use crate::api::{
     build_resolve_request, build_stream_request, build_user_tracks_request, parse_http_response,
     parse_resolve_response, parse_stream_url_response, parse_track_collection_response,
-    pick_best_transcoding, track_resource_id, user_resource_id, ResolveResponse, Track, User,
+    pick_best_transcoding, track_resource_id, user_resource_id, HttpRequest, ResolveResponse,
+    Track, User,
 };
+use crate::client_id::{extract_client_id, extract_js_urls};
 use crate::error::PluginError;
 use crate::extractor::{
     parse_download_path_from_stdout, parse_subprocess_response, yt_dlp_args_for_download_to_file,
@@ -22,6 +26,7 @@ use crate::{
 };
 
 const MAX_ARTIST_TRACK_PAGES: usize = 20;
+const SOUNDCLOUD_HOMEPAGE: &str = "https://soundcloud.com/";
 
 // ── Host function imports ─────────────────────────────────────────────────────
 
@@ -30,6 +35,7 @@ extern "ExtismHost" {
     /// JSON in → JSON out — see `HttpRequest` / `HttpResponse` envelopes.
     fn http_request(req: String) -> String;
     fn get_config(key: String) -> String;
+    fn set_config(entry: String);
     fn run_subprocess(req: String) -> String;
 }
 
@@ -264,9 +270,16 @@ fn resolve(url: &str) -> FnResult<ResolveResponse> {
     parse_resolve_response(&body).map_err(error_to_fn_error)
 }
 
-/// Read the `client_id` config value. Returns an empty string if the
-/// host has not yet wired `get_config` (forward-compatible with the
-/// manifest parser, which currently ignores `[config]`).
+/// Return the `client_id` needed to talk to `api-v2.soundcloud.com`.
+///
+/// Lookup order:
+///   1. The per-plugin config value (populated by a prior successful
+///      discovery or, eventually, by a user-facing settings screen).
+///   2. Auto-discovery by scraping `https://soundcloud.com/` for an
+///      app-bundle URL and regex-extracting the embedded literal.
+///
+/// On discovery success the value is cached via `set_config` so the
+/// next call short-circuits on step 1.
 fn read_client_id() -> String {
     // SAFETY: `get_config` is registered host-side before plugin exports
     // run (see src-tauri/src/adapters/driven/plugin/host_functions.rs:
@@ -275,13 +288,65 @@ fn read_client_id() -> String {
     //      before any `#[plugin_fn]` export is callable.
     //   2. The ABI is `(I64) -> I64`; the `#[host_fn]` macro marshals
     //      `String` in/out.
-    //   3. A missing key or transient error returns the empty default
-    //      so the plugin still builds the URL — the host surfaces the
-    //      401/403 via `http_request`, which `HttpResponse::into_success_body`
-    //      maps to `PluginError::Private` and the user sees a clear
-    //      "SoundCloud resource is private" error.
-    //   4. Inputs/outputs are owned JSON strings — no aliasing concerns.
-    unsafe { get_config("client_id".to_string()) }.unwrap_or_default()
+    //   3. Inputs/outputs are owned JSON strings — no aliasing concerns.
+    let cached = unsafe { get_config("client_id".to_string()) }.unwrap_or_default();
+    if !cached.is_empty() {
+        return cached;
+    }
+    match discover_client_id() {
+        Ok(id) => {
+            // Persist so we only pay the two-hop discovery cost once
+            // per plugin lifetime. The host expects the JSON shape
+            // `{"key":"...","value":"..."}` — see `ConfigEntry` in
+            // `src-tauri/src/adapters/driven/plugin/host_functions.rs`.
+            // A cache-write failure is non-fatal: the current call
+            // still gets the fresh id.
+            let entry = serde_json::json!({ "key": "client_id", "value": id }).to_string();
+            // SAFETY: `set_config` is registered host-side and ABI-compatible
+            // the same way `get_config` is; it accepts a JSON string.
+            let _ = unsafe { set_config(entry) };
+            id
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Fetch soundcloud.com, pull an app-bundle JS URL out of the HTML, and
+/// regex-extract the public `client_id` literal. Returns an error only
+/// if every candidate bundle either fails to download or doesn't match
+/// the marker.
+fn discover_client_id() -> Result<String, PluginError> {
+    let home = fetch_body(SOUNDCLOUD_HOMEPAGE)?;
+    let mut last_err: Option<PluginError> = None;
+    for url in extract_js_urls(&home) {
+        match fetch_body(&url) {
+            Ok(js) => {
+                if let Some(id) = extract_client_id(&js) {
+                    return Ok(id);
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or(PluginError::HostResponse(
+        "no client_id marker in any SoundCloud bundle".into(),
+    )))
+}
+
+/// Minimal GET helper for discovery — no auth, no custom headers.
+fn fetch_body(url: &str) -> Result<String, PluginError> {
+    let req = HttpRequest {
+        method: "GET".into(),
+        url: url.to_string(),
+        headers: HashMap::new(),
+        body: None,
+    };
+    let req_json = serde_json::to_string(&req)?;
+    // SAFETY: same invariants as `http_request` in `perform_soundcloud_request`.
+    let resp_json = unsafe { http_request(req_json) }
+        .map_err(|e| PluginError::HostResponse(e.to_string()))?;
+    let response = parse_http_response(&resp_json)?;
+    response.into_success_body()
 }
 
 /// Call a SoundCloud transcoding template URL to obtain the actual CDN
