@@ -186,7 +186,7 @@ pub fn download_to_file(input: String) -> FnResult<String> {
 }
 
 fn fetch_all_user_tracks(user: &User) -> FnResult<Vec<Track>> {
-    let client_id = read_client_id();
+    let client_id = read_client_id().map_err(error_to_fn_error)?;
     let user_id = user_resource_id(user).ok_or_else(|| {
         error_to_fn_error(PluginError::UnsupportedUrl(format!(
             "artist profile '{}' has no stable id or urn in the resolve response",
@@ -250,7 +250,7 @@ fn fetch_all_user_tracks(user: &User) -> FnResult<Vec<Track>> {
 /// Issue a `/resolve` call against api-v2.soundcloud.com via the host and
 /// return the parsed envelope.
 fn resolve(url: &str) -> FnResult<ResolveResponse> {
-    let client_id = read_client_id();
+    let client_id = read_client_id().map_err(error_to_fn_error)?;
     let req_json = build_resolve_request(url, &client_id).map_err(error_to_fn_error)?;
     // SAFETY: `http_request` is resolved by the Vortex plugin host at
     // load time (see src-tauri/src/adapters/driven/plugin/host_functions.rs:
@@ -280,7 +280,13 @@ fn resolve(url: &str) -> FnResult<ResolveResponse> {
 ///
 /// On discovery success the value is cached via `set_config` so the
 /// next call short-circuits on step 1.
-fn read_client_id() -> String {
+///
+/// A discovery failure is propagated — swallowing it into an empty
+/// string would cause SoundCloud to 401 on the next call, which maps
+/// to the misleading `PluginError::Private` ("resource is private")
+/// message. Surfacing the real cause lets the user see that the
+/// plugin failed to obtain an id, not that their track is locked.
+fn read_client_id() -> Result<String, PluginError> {
     // SAFETY: `get_config` is registered host-side before plugin exports
     // run (see src-tauri/src/adapters/driven/plugin/host_functions.rs:
     // `make_get_config_function`). Invariants:
@@ -289,26 +295,23 @@ fn read_client_id() -> String {
     //   2. The ABI is `(I64) -> I64`; the `#[host_fn]` macro marshals
     //      `String` in/out.
     //   3. Inputs/outputs are owned JSON strings — no aliasing concerns.
-    let cached = unsafe { get_config("client_id".to_string()) }.unwrap_or_default();
+    let cached = unsafe { get_config("client_id".to_string()) }
+        .map_err(|e| PluginError::HostResponse(e.to_string()))?;
     if !cached.is_empty() {
-        return cached;
+        return Ok(cached);
     }
-    match discover_client_id() {
-        Ok(id) => {
-            // Persist so we only pay the two-hop discovery cost once
-            // per plugin lifetime. The host expects the JSON shape
-            // `{"key":"...","value":"..."}` — see `ConfigEntry` in
-            // `src-tauri/src/adapters/driven/plugin/host_functions.rs`.
-            // A cache-write failure is non-fatal: the current call
-            // still gets the fresh id.
-            let entry = serde_json::json!({ "key": "client_id", "value": id }).to_string();
-            // SAFETY: `set_config` is registered host-side and ABI-compatible
-            // the same way `get_config` is; it accepts a JSON string.
-            let _ = unsafe { set_config(entry) };
-            id
-        }
-        Err(_) => String::new(),
-    }
+    let id = discover_client_id()?;
+    // Persist so we only pay the two-hop discovery cost once per plugin
+    // lifetime. The host expects the JSON shape
+    // `{"key":"...","value":"..."}` — see `ConfigEntry` in
+    // `src-tauri/src/adapters/driven/plugin/host_functions.rs`. A
+    // cache-write failure is non-fatal; the current call still gets
+    // the fresh id.
+    let entry = serde_json::json!({ "key": "client_id", "value": id }).to_string();
+    // SAFETY: `set_config` is registered host-side and ABI-compatible
+    // the same way `get_config` is; it accepts a JSON string.
+    let _ = unsafe { set_config(entry) };
+    Ok(id)
 }
 
 /// Fetch soundcloud.com, pull an app-bundle JS URL out of the HTML, and
@@ -355,7 +358,7 @@ fn fetch_body(url: &str) -> Result<String, PluginError> {
 /// The template URL is appended with `?client_id=<id>` and the response
 /// JSON `{ "url": "..." }` is parsed to extract the CDN URL.
 fn fetch_stream_url(template_url: &str) -> FnResult<String> {
-    let client_id = read_client_id();
+    let client_id = read_client_id().map_err(error_to_fn_error)?;
     let req_json = build_stream_request(template_url, &client_id).map_err(error_to_fn_error)?;
     let body = perform_soundcloud_request(req_json)?;
     parse_stream_url_response(&body).map_err(error_to_fn_error)
