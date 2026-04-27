@@ -1,11 +1,12 @@
 [plugin]
 name = "vortex-mod-soundcloud"
-version = "1.2.1"
+version = "1.2.2"
 category = "crawler"
 author = "vortex-community"
 description = "SoundCloud tracks, playlists, and artist profiles"
 license = "GPL-3.0"
 min_vortex_version = "0.1.0"
+repository = "https://github.com/mpiton/vortex-mod-soundcloud"
 
 [capabilities]
 # SoundCloud uses the public resolve API over HTTPS. The plugin delegates
