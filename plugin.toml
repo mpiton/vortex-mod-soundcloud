@@ -1,16 +1,18 @@
 [plugin]
 name = "vortex-mod-soundcloud"
-version = "1.2.1"
+version = "1.3.0"
 category = "crawler"
 author = "vortex-community"
 description = "SoundCloud tracks, playlists, and artist profiles"
 license = "GPL-3.0"
-min_vortex_version = "0.1.0"
+min_vortex_version = "0.2.0"
 
 [capabilities]
 # SoundCloud uses the public resolve API over HTTPS. The plugin delegates
 # all network access to the host via `http_request`, so it never touches
-# sockets directly — all SSRF/egress rules are enforced host-side.
+# sockets directly — all SSRF/egress rules are enforced host-side. Adaptive
+# downloads use the typed `run_ytdlp` broker; the plugin cannot choose a binary,
+# arguments, timeout, environment, or working directory.
 http = true
 subprocess = ["yt-dlp"]
 

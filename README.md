@@ -10,11 +10,13 @@ SoundCloud WASM plugin for [Vortex](https://github.com/mpiton/vortex).
   the CDN URL follows the `-large` marker convention
 - `client_id` is read from host config (`get_config` → `client_id`) so
   that the user can supply their own without rebuilding the plugin
+- Adaptive streams fall back to the host's typed `run_ytdlp` broker; the
+  plugin supplies media fields, never a binary or command-line arguments
 
 ## Requirements
 
-- Vortex plugin host ≥ 0.1.0 with `http_request` and `get_config`
-  host functions enabled.
+- Vortex plugin host ≥ 0.2.0 with `http_request`, `get_config`, and the
+  typed `run_ytdlp` host function enabled.
 
 ## Build
 
