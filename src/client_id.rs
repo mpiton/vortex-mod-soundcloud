@@ -93,7 +93,10 @@ mod tests {
             <script src="https://a-v2.sndcdn.com/assets/bundle-def.js"></script>
         "#;
         let urls = extract_js_urls(html);
-        assert_eq!(urls, vec!["https://a-v2.sndcdn.com/assets/bundle-def.js".to_string()]);
+        assert_eq!(
+            urls,
+            vec!["https://a-v2.sndcdn.com/assets/bundle-def.js".to_string()]
+        );
     }
 
     #[test]
@@ -103,7 +106,10 @@ mod tests {
         let html =
             r#"<script src="https://a-v2.sndcdn.com/assets/x.js"></script><span>other.js</span>"#;
         let urls = extract_js_urls(html);
-        assert_eq!(urls, vec!["https://a-v2.sndcdn.com/assets/x.js".to_string()]);
+        assert_eq!(
+            urls,
+            vec!["https://a-v2.sndcdn.com/assets/x.js".to_string()]
+        );
     }
 
     #[test]

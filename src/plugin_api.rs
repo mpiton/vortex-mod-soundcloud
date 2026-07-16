@@ -16,8 +16,7 @@ use crate::api::{
 use crate::client_id::{extract_client_id, extract_js_urls};
 use crate::error::PluginError;
 use crate::extractor::{
-    parse_download_path_from_stdout, parse_subprocess_response, yt_dlp_args_for_download_to_file,
-    DEFAULT_DOWNLOAD_TIMEOUT_MS,
+    build_ytdlp_download_request, parse_download_path_from_stdout, parse_ytdlp_response,
 };
 use crate::{
     build_artist_response, build_playlist_response, build_single_track_response, ensure_playlist,
@@ -36,7 +35,7 @@ extern "ExtismHost" {
     fn http_request(req: String) -> String;
     fn get_config(key: String) -> String;
     fn set_config(entry: String);
-    fn run_subprocess(req: String) -> String;
+    fn run_ytdlp(req: String) -> String;
 }
 
 // ── Plugin function exports ───────────────────────────────────────────────────
@@ -171,17 +170,14 @@ pub fn download_to_file(input: String) -> FnResult<String> {
 
     ensure_track(&params.url).map_err(error_to_fn_error)?;
 
-    let args = yt_dlp_args_for_download_to_file(&params.url, &params.format, &params.output_dir);
-    let req = crate::extractor::SubprocessRequest {
-        binary: "yt-dlp".into(),
-        args,
-        timeout_ms: DEFAULT_DOWNLOAD_TIMEOUT_MS,
-    };
+    let req = build_ytdlp_download_request(&params.url, &params.format, &params.output_dir);
     let req_json =
         serde_json::to_string(&req).map_err(|e| error_to_fn_error(PluginError::SerdeJson(e)))?;
 
-    let resp_json = unsafe { run_subprocess(req_json)? };
-    let stdout = parse_subprocess_response(&resp_json).map_err(error_to_fn_error)?;
+    // SAFETY: Vortex 0.2+ registers the typed `run_ytdlp` broker for plugins
+    // declaring `subprocess:yt-dlp`; the Extism PDK marshals owned JSON strings.
+    let resp_json = unsafe { run_ytdlp(req_json)? };
+    let stdout = parse_ytdlp_response(&resp_json).map_err(error_to_fn_error)?;
     parse_download_path_from_stdout(&stdout).map_err(error_to_fn_error)
 }
 
@@ -346,8 +342,8 @@ fn fetch_body(url: &str) -> Result<String, PluginError> {
     };
     let req_json = serde_json::to_string(&req)?;
     // SAFETY: same invariants as `http_request` in `perform_soundcloud_request`.
-    let resp_json = unsafe { http_request(req_json) }
-        .map_err(|e| PluginError::HostResponse(e.to_string()))?;
+    let resp_json =
+        unsafe { http_request(req_json) }.map_err(|e| PluginError::HostResponse(e.to_string()))?;
     let response = parse_http_response(&resp_json)?;
     response.into_success_body()
 }
